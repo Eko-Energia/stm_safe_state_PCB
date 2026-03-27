@@ -1,0 +1,4 @@
+../Core/Src/can_driver.c:29:6:CAN_init	56	static
+../Core/Src/can_driver.c:64:19:CAN_addScheduledMessage	24	static
+../Core/Src/can_driver.c:96:19:CAN_removeScheduledMessage	32	static
+../Core/Src/can_driver.c:119:6:CAN_handleScheduled	64	dynamic
