@@ -2,3 +2,5 @@
 ../Core/Src/can_driver.c:64:19:CAN_addScheduledMessage	8
 ../Core/Src/can_driver.c:96:19:CAN_removeScheduledMessage	7
 ../Core/Src/can_driver.c:119:6:CAN_handleScheduled	8
+../Core/Src/can_driver.c:156:19:CAN_addRxHandler	5
+../Core/Src/can_driver.c:180:6:CAN_dispatchRx	7

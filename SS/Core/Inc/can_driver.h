@@ -100,4 +100,27 @@ HAL_StatusTypeDef CAN_addScheduledMessage(struct CAN_scheduledMsg msg, struct CA
 
 HAL_StatusTypeDef CAN_removeScheduledMessage(uint32_t id, struct CAN_scheduledMsgList *buffer);
 
+/* ---- RX dispatch ---- */
+typedef void (*CAN_RxCallback)(uint8_t *data, uint8_t dlc, void *context);
+
+struct CAN_rxHandler {
+    uint32_t id;               // ID ramki do obsługi
+    uint8_t  ide;              // CAN_ID_STD lub CAN_ID_EXT
+    CAN_RxCallback callback;   // funkcja wywoływana po odebraniu
+    void *context;             // opcjonalny kontekst (może być NULL)
+};
+
+struct CAN_rxHandlerList {
+    struct CAN_rxHandler list[CAN_MAX_MSG];
+    uint8_t size;
+};
+
+/* Funkcje RX */
+HAL_StatusTypeDef CAN_addRxHandler(struct CAN_rxHandler handler,
+                                   struct CAN_rxHandlerList *table);
+
+void CAN_dispatchRx(CAN_HandleTypeDef *hcanPtr,
+                    struct CAN_rxHandlerList *table);
+
+
 #endif /* INC_CAN_DRIVER_H_ */

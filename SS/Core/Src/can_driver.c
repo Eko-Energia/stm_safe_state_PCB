@@ -150,3 +150,56 @@ void CAN_handleScheduled(CAN_HandleTypeDef *hcanPtr, struct CAN_scheduledMsgList
 		}
 	}
 }
+/**
+ * @brief Rejestruje handler dla danego ID ramki
+ */
+HAL_StatusTypeDef CAN_addRxHandler(struct CAN_rxHandler handler,
+                                   struct CAN_rxHandlerList *table)
+{
+    if (table->size >= CAN_MAX_MSG - 1) {
+        Error_Handler();
+    }
+
+    /* Sprawdź duplikat ID */
+    for (uint8_t i = 0; i < table->size; i++) {
+        if (table->list[i].ide == handler.ide &&
+            table->list[i].id  == handler.id) {
+            return HAL_ERROR;  /* już zarejestrowany */
+        }
+    }
+
+    table->list[table->size] = handler;
+    table->size++;
+    return HAL_OK;
+}
+
+/**
+ * @brief Czyta ramkę z FIFO i wywołuje odpowiedni callback
+ *        Wywołuj z HAL_CAN_RxFifo0MsgPendingCallback !
+ */
+void CAN_dispatchRx(CAN_HandleTypeDef *hcanPtr,
+                    struct CAN_rxHandlerList *table)
+{
+    CAN_RxHeaderTypeDef rxHeader;
+    uint8_t rxData[8];
+
+    if (HAL_CAN_GetRxMessage(hcanPtr, CAN_RX_FIFO0,
+                             &rxHeader, rxData) != HAL_OK) {
+        return;
+    }
+
+    uint32_t rxId  = (rxHeader.IDE == CAN_ID_STD)
+                     ? rxHeader.StdId : rxHeader.ExtId;
+
+    for (uint8_t i = 0; i < table->size; i++) {
+        if (table->list[i].ide == rxHeader.IDE &&
+            table->list[i].id  == rxId) {
+            if (table->list[i].callback != NULL) {
+                table->list[i].callback(rxData, rxHeader.DLC,
+                                        table->list[i].context);
+            }
+            return;  /* jeden handler na ID — wychodzimy */
+        }
+    }
+    /* Brak handlera — ramka zignorowana (możesz tu dodać log) */
+}

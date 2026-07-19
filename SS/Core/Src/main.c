@@ -26,7 +26,7 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-#define ADC_THRESHOLD       0        // Wyślij CAN gdy ADC == 0
+#define ADC_THRESHOLD       100        // Wyślij CAN gdy ADC == 0
 #define CAN_TX_ID_ADC       0x100    // ID ramki ADC (normalny pomiar)
 #define CAN_TX_ID_ZERO      0x100    // ID ramki gdy ADC == 0 (te same, dane 0x0000)
 #define CAN_HIGH_PRIO_MAX   0x0FF    // Ramki z ID <= tego są "wyższy priorytet"
@@ -50,10 +50,20 @@ CAN_HandleTypeDef hcan;
 
 /* USER CODE BEGIN PV */
 static volatile uint32_t adcValue = 0;
-static volatile uint8_t rxHighPrio = 0;
-
+static volatile uint8_t  rxFlag   = 0;  // ustawiana przez callback RX
+static volatile uint8_t rxHighPrio = 0; // High priority message received flag
 
 static struct CAN_scheduledMsgList canScheduler = {0};
+
+typedef struct {
+    uint16_t ErrorCode;
+    uint8_t  Severity;
+    uint8_t  Node_Execution_Halted;
+    uint8_t  Reserved;
+    uint64_t Error_Specific_Data;
+} SafeState_t;
+
+static SafeState_t safeStateData = {0};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -63,52 +73,42 @@ static void MX_ADC1_Init(void);
 static void MX_CAN_Init(void);
 /* USER CODE BEGIN PFP */
 
+
+
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-static void CAN_Filter_Config(void)
-{
-    CAN_FilterTypeDef filterConfig = {0};
 
-    filterConfig.FilterBank           = 0;
-    filterConfig.FilterMode           = CAN_FILTERMODE_IDMASK;
-    filterConfig.FilterScale          = CAN_FILTERSCALE_32BIT;
-    filterConfig.FilterIdHigh         = 0x0000;
-    filterConfig.FilterIdLow          = 0x0000;
-    filterConfig.FilterMaskIdHigh     = 0x0000;   // Maska 0 = akceptuj wszystko
-    filterConfig.FilterMaskIdLow      = 0x0000;
-    filterConfig.FilterFIFOAssignment = CAN_RX_FIFO0;
-    filterConfig.FilterActivation     = ENABLE;
-
-    if (HAL_CAN_ConfigFilter(&hcan, &filterConfig) != HAL_OK)
-    {
-        Error_Handler();
-    }
-}
 static void ADC_getData(uint8_t *data, void *context)
 {
     (void)context;
-    uint32_t val = adcValue;
-    data[0] = (val >> 8) & 0xFF;   // High byte
-    data[1] =  val       & 0xFF;   // Low byte
+    uint16_t val = adcValue;
+    data[0] = (val >> 8) & 0xFF;  // High byte
+    data[1] =  val       & 0xFF;  // Low byte
 }
-static void CAN_SendZeroFrame(void)
+static void SafeState_getData(uint8_t *data, void *context)
 {
-    CAN_TxHeaderTypeDef hdr = {
-        .StdId              = CAN_TX_ID_ZERO,
-        .ExtId              = 0,
-        .IDE                = CAN_ID_STD,
-        .RTR                = CAN_RTR_DATA,
-        .DLC                = 2,
-        .TransmitGlobalTime = DISABLE,
-    };
-    uint8_t  zeroData[2] = {0x00, 0x00};
-    uint32_t mailbox;
+    (void)context;
 
-    /* Jeśli wszystkie mailboxy zajęte – po prostu pomiń (nie blokuj pętli) */
-    HAL_CAN_AddTxMessage(&hcan, &hdr, zeroData, &mailbox);
+    // Bajty 0-1: ErrorCode
+    data[0] =  safeStateData.ErrorCode       & 0xFF;
+    data[1] = (safeStateData.ErrorCode >> 8) & 0xFF;
+
+    // Bajt 2: bits 16-23
+    // [3:0] = Reserved, [6:4] = Severity, [7] = Node_Execution_Halted
+    data[2] =  (safeStateData.Reserved            & 0x0F)
+             | ((safeStateData.Severity            & 0x07) << 4)
+             | ((safeStateData.Node_Execution_Halted & 0x01) << 7);
+
+    // Bajty 3-7: Error_Specific_Data (40 bitów)
+    data[3] =  safeStateData.Error_Specific_Data        & 0xFF;
+    data[4] = (safeStateData.Error_Specific_Data >>  8) & 0xFF;
+    data[5] = (safeStateData.Error_Specific_Data >> 16) & 0xFF;
+    data[6] = (safeStateData.Error_Specific_Data >> 24) & 0xFF;
+    data[7] = (safeStateData.Error_Specific_Data >> 32) & 0xFF;
 }
 
 
@@ -147,51 +147,57 @@ int main(void)
   MX_CAN_Init();
   /* USER CODE BEGIN 2 */
 
-  if(HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK)
-  {
-      Error_Handler();
-  }
-  CAN_Filter_Config();
-  CAN_init(&hcan);
+  if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK)
+         Error_Handler();
 
+     CAN_init(&hcan);
 
-  if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
-  {
-      Error_Handler();
-  }
+     if (HAL_ADC_Start(&hadc1) != HAL_OK)
+         Error_Handler();
 
-  /* --- ADC: start ciągłej konwersji --- */
-  if (HAL_ADC_Start(&hadc1) != HAL_OK)
-  {
-      Error_Handler();
-  }
+     // Ramka ADC 0x100 — wartość ADC co 2000ms
+     struct CAN_scheduledMsg adcMsg = {
+         .header = {
+             .StdId              = 0x100,
+             .ExtId              = 0,
+             .IDE                = CAN_ID_STD,
+             .RTR                = CAN_RTR_DATA,
+             .DLC                = 2,
+             .TransmitGlobalTime = DISABLE,
+         },
+         .periodMs = 2000,
+         .getData  = ADC_getData,
+         .context  = NULL,
+     };
+     if (CAN_addScheduledMessage(adcMsg, &canScheduler) != HAL_OK)
+         Error_Handler();
 
-  struct CAN_scheduledMsg adcMsg = {
-          .header = {
-              .StdId              = CAN_TX_ID_ADC,
-              .ExtId              = 0,
-              .IDE                = CAN_ID_STD,
-              .RTR                = CAN_RTR_DATA,
-              .DLC                = 2,
-              .TransmitGlobalTime = DISABLE,
-          },
-          .periodMs = 10,
-          .getData  = ADC_getData,
-          .context  = NULL,
-      };
+     // Ramka SafeState ID=1 — stan systemu co 2000ms
+     struct CAN_scheduledMsg safeStateMsg = {
+         .header = {
+             .StdId              = 0,
+             .ExtId              = 0,
+             .IDE                = CAN_ID_STD,
+             .RTR                = CAN_RTR_DATA,
+             .DLC                = 8,
+             .TransmitGlobalTime = DISABLE,
+         },
+         .periodMs = 1000,
+         .getData  = SafeState_getData,
+         .context  = NULL,
+     };
+     if (CAN_addScheduledMessage(safeStateMsg, &canScheduler) != HAL_OK)
+         Error_Handler();
 
-  if (CAN_addScheduledMessage(adcMsg, &canScheduler) != HAL_OK)
-  {
-      Error_Handler();
-  }
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  uint32_t lastLedToggle = 0;
 
+  uint32_t lastLedToggle = 0;
+  HAL_GPIO_WritePin(GPIOA, control_status_Pin, GPIO_PIN_SET);
   while (1)
   {
 
@@ -200,22 +206,29 @@ int main(void)
 	  {
 		  adcValue = HAL_ADC_GetValue(&hadc1);
 	  }
-
-	  if(adcValue == ADC_THRESHOLD)
+	  safeStateData.ErrorCode = (adcValue < ADC_THRESHOLD) ? 1 : 0;//zaleznie od tego ustawimy stan pracy
+	  CAN_handleScheduled(&hcan, &canScheduler);
+	  if(adcValue < ADC_THRESHOLD)
 	  {
-		  CAN_SendZeroFrame();//wysyłamy bramke safe state
+		  CAN_handleScheduled(&hcan, &canScheduler);
+	  }
+	  CAN_handleScheduled(&hcan, &canScheduler);
+
+	  if(HAL_ADC_PollForConversion(&hadc1, 1) == HAL_OK)
+	  {
+	      adcValue = HAL_ADC_GetValue(&hadc1);
 	  }
 
+	  safeStateData.ErrorCode = (adcValue < ADC_THRESHOLD) ? 1 : 0;
+	  if(adcValue < ADC_THRESHOLD)
+	  {
+	      CAN_handleScheduled(&hcan, &canScheduler);
+	  }
 	  if(rxHighPrio)
 	  {
 		  rxHighPrio = 0;//kasujemy flage
           HAL_GPIO_WritePin(GPIOA, control_status_Pin, GPIO_PIN_RESET);
-
 	  }
-
-      CAN_handleScheduled(&hcan, &canScheduler);
-
-
       uint32_t now = HAL_GetTick();
       if ((now - lastLedToggle) >= LED_TOGGLE_MS)
       {
@@ -257,7 +270,7 @@ void SystemClock_Config(void)
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV2;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
@@ -299,7 +312,7 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
   hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
-  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
@@ -360,11 +373,11 @@ static void MX_CAN_Init(void)
   hcan.Init.Mode = CAN_MODE_NORMAL;
   hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
   hcan.Init.TimeSeg1 = CAN_BS1_13TQ;
-  hcan.Init.TimeSeg2 = CAN_BS2_6TQ;
+  hcan.Init.TimeSeg2 = CAN_BS2_2TQ;
   hcan.Init.TimeTriggeredMode = DISABLE;
   hcan.Init.AutoBusOff = DISABLE;
   hcan.Init.AutoWakeUp = DISABLE;
-  hcan.Init.AutoRetransmission = DISABLE;
+  hcan.Init.AutoRetransmission = ENABLE;
   hcan.Init.ReceiveFifoLocked = DISABLE;
   hcan.Init.TransmitFifoPriority = DISABLE;
   if (HAL_CAN_Init(&hcan) != HAL_OK)
@@ -408,24 +421,22 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan_ptr)
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcanPtr)
 {
     CAN_RxHeaderTypeDef rxHeader;
     uint8_t rxData[8];
 
-    if (HAL_CAN_GetRxMessage(hcan_ptr, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK)
+    HAL_CAN_GetRxMessage(hcanPtr, CAN_RX_FIFO0, &rxHeader, rxData);
+
+    // Odczytaj ErrorCode z bajtów 0-1 (little-endian)
+    uint16_t errorCode = (uint16_t)rxData[0] | ((uint16_t)rxData[1] << 8);
+
+    if (errorCode != 0)
     {
-        /*
-         * "Wyższy priorytet" w CAN = niższy numerycznie StdId.
-         * Nasza ramka ADC idzie jako 0x100.
-         * Cokolwiek z ID <= 0x0FF traktujemy jako ważniejsze.
-         */
-        if (rxHeader.IDE == CAN_ID_STD && rxHeader.StdId <= CAN_HIGH_PRIO_MAX)
-        {
-            rxHighPrio = 1;   // Ustaw flagę – obsługa w pętli głównej
-        }
+        rxHighPrio = 1;
     }
 }
+
 /* USER CODE END 4 */
 
 /**
