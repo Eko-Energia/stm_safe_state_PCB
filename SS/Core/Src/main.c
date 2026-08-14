@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "can_driver.h"
+#include "app_sync_tick.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -184,6 +185,8 @@ int main(void)
   {
       Error_Handler();
   }
+
+  SyncTickTest_Init(&canScheduler);
 
   /* USER CODE END 2 */
 
