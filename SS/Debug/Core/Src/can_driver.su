@@ -1,6 +1,9 @@
-../Core/Src/can_driver.c:29:6:CAN_init	56	static
-../Core/Src/can_driver.c:64:19:CAN_addScheduledMessage	24	static
-../Core/Src/can_driver.c:96:19:CAN_removeScheduledMessage	32	static
-../Core/Src/can_driver.c:119:6:CAN_handleScheduled	64	dynamic
-../Core/Src/can_driver.c:156:19:CAN_addRxHandler	40	static
-../Core/Src/can_driver.c:180:6:CAN_dispatchRx	72	static
+../Core/Src/can_driver.c:29:19:CAN_setStdIdListFilter	80	static
+../Core/Src/can_driver.c:74:26:CAN_setAcceptAllFilter	56	static
+../Core/Src/can_driver.c:96:19:CAN_init	32	static
+../Core/Src/can_driver.c:150:19:CAN_addScheduledMessage	24	static
+../Core/Src/can_driver.c:182:19:CAN_removeScheduledMessage	32	static
+../Core/Src/can_driver.c:209:6:CAN_handleScheduled	40	static
+../Core/Src/can_driver.c:251:19:CAN_sendStdFrame	64	static
+../Core/Src/can_driver.c:291:19:CAN_addRxHandler	32	static
+../Core/Src/can_driver.c:315:6:CAN_dispatchRx	72	static

@@ -1,6 +1,9 @@
-../Core/Src/can_driver.c:29:6:CAN_init	4
-../Core/Src/can_driver.c:64:19:CAN_addScheduledMessage	8
-../Core/Src/can_driver.c:96:19:CAN_removeScheduledMessage	7
-../Core/Src/can_driver.c:119:6:CAN_handleScheduled	8
-../Core/Src/can_driver.c:156:19:CAN_addRxHandler	5
-../Core/Src/can_driver.c:180:6:CAN_dispatchRx	7
+../Core/Src/can_driver.c:29:19:CAN_setStdIdListFilter	9
+../Core/Src/can_driver.c:74:26:CAN_setAcceptAllFilter	1
+../Core/Src/can_driver.c:96:19:CAN_init	9
+../Core/Src/can_driver.c:150:19:CAN_addScheduledMessage	10
+../Core/Src/can_driver.c:182:19:CAN_removeScheduledMessage	8
+../Core/Src/can_driver.c:209:6:CAN_handleScheduled	8
+../Core/Src/can_driver.c:251:19:CAN_sendStdFrame	8
+../Core/Src/can_driver.c:291:19:CAN_addRxHandler	6
+../Core/Src/can_driver.c:315:6:CAN_dispatchRx	7
