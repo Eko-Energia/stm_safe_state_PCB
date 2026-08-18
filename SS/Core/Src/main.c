@@ -27,11 +27,30 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-#define ADC_THRESHOLD       0        // Wyślij CAN gdy ADC == 0
-#define CAN_TX_ID_ADC       0x100    // ID ramki ADC (normalny pomiar)
-#define CAN_TX_ID_ZERO      0x100    // ID ramki gdy ADC == 0 (te same, dane 0x0000)
-#define CAN_HIGH_PRIO_MAX   0x0FF    // Ramki z ID <= tego są "wyższy priorytet"
-#define LED_TOGGLE_MS       200      // Okres migania LED [ms]
+#define ADC_THRESHOLD         100      // Ponizej tej wartosci ADC -> podnapiecie
+#define ADC_HYSTERESIS        20       // Powrot do normy dopiero powyzej THRESHOLD+HYST
+#define LED_TOGGLE_MS         200      // Okres migania LED [ms]
+
+/* DIAGNOSTYKA RX - przelacznik do bisekcji problemu z callbackiem:
+ *   1 = przyjmuj KAZDA ramke z magistrali (filtr wylaczony)
+ *   0 = tryb docelowy, tylko SAFE_STATE_ACTIV_ID
+ * Jesli przy 1 callback wchodzi, a przy 0 nie - CANtool wysyla ramke
+ * w zlym formacie (Extended zamiast Standard albo Remote zamiast Data). */
+#define CAN_RX_PROMISCUOUS    1
+
+/* Ramka SafeState_NODE - heartbeat wezla. ID i okres wg CAN_DB.dbc
+ * (BO_ 3, GenMsgCycleTime 5000). Leci bezwarunkowo, bez kodow bledow. */
+#define CAN_TX_ID_SAFESTATE   SAFE_STATE_NODE_ID
+#define CAN_PERIOD_SS_MS      5000
+
+/* Ramka SafeState_Activ - dokladana do schedulera na czas podnapiecia i
+ * usuwana po powrocie do normy. Wg CAN_DB.dbc (BO_ 1) ma 8 bajtow i nie ma
+ * zdefiniowanych sygnalow, dlatego payload jest zerowy.
+ * DBC podaje GenMsgCycleTime 0 (ramka zdarzeniowa) - okres ponizej jest
+ * naszym wyborem i wymaga uzgodnienia z zespolem. */
+#define CAN_TX_ID_SS_ACTIV      SAFE_STATE_ACTIV_ID
+#define CAN_DLC_SS_ACTIV        8
+#define CAN_PERIOD_SS_ACTIV_MS  100
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -51,10 +70,41 @@ CAN_HandleTypeDef hcan;
 
 /* USER CODE BEGIN PV */
 static volatile uint32_t adcValue = 0;
-static volatile uint8_t rxHighPrio = 0;
+static volatile uint8_t rxHighPrio = 0; // High priority message received flag
 
+/* Liczniki diagnostyczne - do podgladu debuggerem */
+static volatile uint32_t canBusOffCount = 0;
+static volatile uint32_t canErrorCount  = 0;
+
+/* Stan detekcji podnapiecia (z histereza) */
+static uint8_t adcUnderVoltage = 0;             // 1 = jestesmy ponizej progu
+static volatile uint32_t ssActivCount = 0;      // ile razy weszlismy w podnapiecie
+
+/* Diagnostyka RX - co faktycznie przyszlo z magistrali */
+static volatile uint32_t canRxCount   = 0;
+static volatile uint32_t canRxLastId  = 0;
+static volatile uint8_t  canRxLastIde = 0;  // 0 = Standard, 4 = Extended
+static volatile uint8_t  canRxLastRtr = 0;  // 0 = Data,     2 = Remote
+static volatile uint8_t  canRxLastDlc = 0;
+
+#if !CAN_RX_PROMISCUOUS
+/* Jedyne ID przyjmowane przez ten wezel - pozostale ramki odrzuca sprzet,
+ * wiec callback RX w ogole sie dla nich nie uruchamia */
+static const uint16_t canAcceptedIds[] = { SAFE_STATE_ACTIV_ID };
+#define CAN_ACCEPTED_ID_COUNT ((uint8_t)(sizeof(canAcceptedIds) / sizeof(canAcceptedIds[0])))
+#endif
 
 static struct CAN_scheduledMsgList canScheduler = {0};
+
+typedef struct {
+    uint16_t ErrorCode;
+    uint8_t  Severity;
+    uint8_t  Node_Execution_Halted;
+    uint8_t  Reserved;
+    uint64_t Error_Specific_Data;
+} SafeState_t;
+
+static SafeState_t safeStateData = {0};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -64,52 +114,41 @@ static void MX_ADC1_Init(void);
 static void MX_CAN_Init(void);
 /* USER CODE BEGIN PFP */
 
+
+
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-static void CAN_Filter_Config(void)
-{
-    CAN_FilterTypeDef filterConfig = {0};
 
-    filterConfig.FilterBank           = 0;
-    filterConfig.FilterMode           = CAN_FILTERMODE_IDMASK;
-    filterConfig.FilterScale          = CAN_FILTERSCALE_32BIT;
-    filterConfig.FilterIdHigh         = 0x0000;
-    filterConfig.FilterIdLow          = 0x0000;
-    filterConfig.FilterMaskIdHigh     = 0x0000;   // Maska 0 = akceptuj wszystko
-    filterConfig.FilterMaskIdLow      = 0x0000;
-    filterConfig.FilterFIFOAssignment = CAN_RX_FIFO0;
-    filterConfig.FilterActivation     = ENABLE;
-
-    if (HAL_CAN_ConfigFilter(&hcan, &filterConfig) != HAL_OK)
-    {
-        Error_Handler();
-    }
-}
-static void ADC_getData(uint8_t *data, void *context)
+/**
+  * @brief Pakuje ramke SafeState_NODE wg CAN_DB.dbc (BO_ 3)
+  *
+  * ErrorCode 0|16@1+ | Reserved 16|4@1+ | Severity 20|3@1+
+  * Node_Execution_Halted 23|1@1+ | Error_Specific_Data 24|40@1+
+  */
+static void SafeState_getData(uint8_t *data, void *context)
 {
     (void)context;
-    uint32_t val = adcValue;
-    data[0] = (val >> 8) & 0xFF;   // High byte
-    data[1] =  val       & 0xFF;   // Low byte
-}
-static void CAN_SendZeroFrame(void)
-{
-    CAN_TxHeaderTypeDef hdr = {
-        .StdId              = CAN_TX_ID_ZERO,
-        .ExtId              = 0,
-        .IDE                = CAN_ID_STD,
-        .RTR                = CAN_RTR_DATA,
-        .DLC                = 2,
-        .TransmitGlobalTime = DISABLE,
-    };
-    uint8_t  zeroData[2] = {0x00, 0x00};
-    uint32_t mailbox;
 
-    /* Jeśli wszystkie mailboxy zajęte – po prostu pomiń (nie blokuj pętli) */
-    HAL_CAN_AddTxMessage(&hcan, &hdr, zeroData, &mailbox);
+    // Bajty 0-1: ErrorCode
+    data[0] =  safeStateData.ErrorCode       & 0xFF;
+    data[1] = (safeStateData.ErrorCode >> 8) & 0xFF;
+
+    // Bajt 2: bits 16-23
+    // [3:0] = Reserved, [6:4] = Severity, [7] = Node_Execution_Halted
+    data[2] =  (safeStateData.Reserved            & 0x0F)
+             | ((safeStateData.Severity            & 0x07) << 4)
+             | ((safeStateData.Node_Execution_Halted & 0x01) << 7);
+
+    // Bajty 3-7: Error_Specific_Data (40 bitów)
+    data[3] =  safeStateData.Error_Specific_Data        & 0xFF;
+    data[4] = (safeStateData.Error_Specific_Data >>  8) & 0xFF;
+    data[5] = (safeStateData.Error_Specific_Data >> 16) & 0xFF;
+    data[6] = (safeStateData.Error_Specific_Data >> 24) & 0xFF;
+    data[7] = (safeStateData.Error_Specific_Data >> 32) & 0xFF;
 }
 
 
@@ -148,43 +187,36 @@ int main(void)
   MX_CAN_Init();
   /* USER CODE BEGIN 2 */
 
-  if(HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK)
-  {
+  if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK)
       Error_Handler();
-  }
-  CAN_Filter_Config();
-  CAN_init(&hcan);
 
-
-  if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
-  {
+#if CAN_RX_PROMISCUOUS
+  if (CAN_init(&hcan, NULL, 0) != HAL_OK)          // filtr wylaczony - patrz CAN_RX_PROMISCUOUS
+#else
+  if (CAN_init(&hcan, canAcceptedIds, CAN_ACCEPTED_ID_COUNT) != HAL_OK)
+#endif
       Error_Handler();
-  }
 
-  /* --- ADC: start ciągłej konwersji --- */
   if (HAL_ADC_Start(&hadc1) != HAL_OK)
-  {
       Error_Handler();
-  }
 
-  struct CAN_scheduledMsg adcMsg = {
-          .header = {
-              .StdId              = CAN_TX_ID_ADC,
-              .ExtId              = 0,
-              .IDE                = CAN_ID_STD,
-              .RTR                = CAN_RTR_DATA,
-              .DLC                = 2,
-              .TransmitGlobalTime = DISABLE,
-          },
-          .periodMs = 10,
-          .getData  = ADC_getData,
-          .context  = NULL,
-      };
-
-  if (CAN_addScheduledMessage(adcMsg, &canScheduler) != HAL_OK)
-  {
+  // Ramka SafeState_NODE - heartbeat wezla, leci bezwarunkowo
+  struct CAN_scheduledMsg safeStateMsg = {
+      .header = {
+          .StdId              = CAN_TX_ID_SAFESTATE,
+          .ExtId              = 0,
+          .IDE                = CAN_ID_STD,
+          .RTR                = CAN_RTR_DATA,
+          .DLC                = 8,
+          .TransmitGlobalTime = DISABLE,
+      },
+      .periodMs = CAN_PERIOD_SS_MS,
+      .getData  = SafeState_getData,
+      .context  = NULL,
+  };
+  if (CAN_addScheduledMessage(safeStateMsg, &canScheduler) != HAL_OK)
       Error_Handler();
-  }
+
 
   SyncTickTest_Init(&canScheduler);
 
@@ -193,38 +225,72 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  uint32_t lastLedToggle = 0;
 
+  /* Szablon ramki SafeState_Activ. Nie jest rejestrowana od razu - trafia do
+   * schedulera dopiero na czas podnapiecia. getData = NULL, bo payload ma byc
+   * zerowy, a CAN_handleScheduled zeruje bufor przed wyslaniem. */
+  struct CAN_scheduledMsg ssActivMsg = {
+      .header = {
+          .StdId              = CAN_TX_ID_SS_ACTIV,
+          .ExtId              = 0,
+          .IDE                = CAN_ID_STD,
+          .RTR                = CAN_RTR_DATA,
+          .DLC                = CAN_DLC_SS_ACTIV,
+          .TransmitGlobalTime = DISABLE,
+      },
+      .periodMs = CAN_PERIOD_SS_ACTIV_MS,
+      .getData  = NULL,
+      .context  = NULL,
+  };
+
+  uint32_t lastLedToggle = 0;
+  HAL_GPIO_WritePin(GPIOA, control_status_Pin, GPIO_PIN_SET);
   while (1)
   {
-
-
-	  if(HAL_ADC_PollForConversion(&hadc1, 1) == HAL_OK)
+	  // 1. Pomiar ADC (tryb continuous - czekamy max 1 ms na EOC)
+	  if (HAL_ADC_PollForConversion(&hadc1, 1) == HAL_OK)
 	  {
 		  adcValue = HAL_ADC_GetValue(&hadc1);
 	  }
 
-	  if(adcValue == ADC_THRESHOLD)
+	  // 2. Detekcja zbocza podnapiecia. Na czas trwania bledu ramka
+	  //    SafeState_Activ dolacza do schedulera i leci cyklicznie obok NODE.
+	  //    Histereza chroni magistrale przed lawina, gdy pomiar drga wokol progu.
+	  if (!adcUnderVoltage)
 	  {
-		  CAN_SendZeroFrame();//wysyłamy bramke safe state
+		  if (adcValue < ADC_THRESHOLD)
+		  {
+			  adcUnderVoltage = 1;
+			  ssActivCount++;
+			  (void)CAN_addScheduledMessage(ssActivMsg, &canScheduler);
+		  }
+	  }
+	  else
+	  {
+		  if (adcValue > (ADC_THRESHOLD + ADC_HYSTERESIS))
+		  {
+			  adcUnderVoltage = 0;
+			  (void)CAN_removeScheduledMessage(CAN_TX_ID_SS_ACTIV, &canScheduler);
+		  }
 	  }
 
-	  if(rxHighPrio)
-	  {
-		  rxHighPrio = 0;//kasujemy flage
-          HAL_GPIO_WritePin(GPIOA, control_status_Pin, GPIO_PIN_RESET);
+	  // 3. Wysylka ramek okresowych (o tempie decyduje periodMs, nie liczba wywolan)
+	  CAN_handleScheduled(&hcan, &canScheduler);
 
+	  // 4. Reakcja na odebrana ramke wysokiego priorytetu
+	  if (rxHighPrio)
+	  {
+		  rxHighPrio = 0;
+		  HAL_GPIO_WritePin(GPIOA, control_status_Pin, GPIO_PIN_RESET);
 	  }
 
-      CAN_handleScheduled(&hcan, &canScheduler);
-
-
-      uint32_t now = HAL_GetTick();
-      if ((now - lastLedToggle) >= LED_TOGGLE_MS)
-      {
-          lastLedToggle = now;
-          HAL_GPIO_TogglePin(GPIOA, LED_Pin);
-      }
+	  // 5. Heartbeat LED
+	  uint32_t now = HAL_GetTick();
+	  if ((now - lastLedToggle) >= LED_TOGGLE_MS)
+	  {
+		  lastLedToggle = now;
+		  HAL_GPIO_TogglePin(GPIOA, LED_Pin);
+	  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -260,7 +326,7 @@ void SystemClock_Config(void)
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV2;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
@@ -302,7 +368,7 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
   hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
-  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
@@ -363,11 +429,11 @@ static void MX_CAN_Init(void)
   hcan.Init.Mode = CAN_MODE_NORMAL;
   hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
   hcan.Init.TimeSeg1 = CAN_BS1_13TQ;
-  hcan.Init.TimeSeg2 = CAN_BS2_6TQ;
+  hcan.Init.TimeSeg2 = CAN_BS2_2TQ;
   hcan.Init.TimeTriggeredMode = DISABLE;
-  hcan.Init.AutoBusOff = DISABLE;
+  hcan.Init.AutoBusOff = ENABLE;
   hcan.Init.AutoWakeUp = DISABLE;
-  hcan.Init.AutoRetransmission = DISABLE;
+  hcan.Init.AutoRetransmission = ENABLE;
   hcan.Init.ReceiveFifoLocked = DISABLE;
   hcan.Init.TransmitFifoPriority = DISABLE;
   if (HAL_CAN_Init(&hcan) != HAL_OK)
@@ -411,24 +477,55 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan_ptr)
+/**
+  * @brief Callback ramki odebranej w FIFO0
+  *
+  * W trybie docelowym (CAN_RX_PROMISCUOUS = 0) filtr sprzetowy przepuszcza
+  * wylacznie SAFE_STATE_ACTIV_ID, wiec kazda ramka podnosi flage bez
+  * sprawdzania ID. Przy CAN_RX_PROMISCUOUS = 1 wchodza tu wszystkie ramki -
+  * sluzy to wylacznie diagnostyce.
+  */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcanPtr)
 {
     CAN_RxHeaderTypeDef rxHeader;
-    uint8_t rxData[8];
+    uint8_t rxData[CAN_MAX_DLC];
 
-    if (HAL_CAN_GetRxMessage(hcan_ptr, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK)
+    if (HAL_CAN_GetRxMessage(hcanPtr, CAN_RX_FIFO0, &rxHeader, rxData) != HAL_OK)
     {
-        /*
-         * "Wyższy priorytet" w CAN = niższy numerycznie StdId.
-         * Nasza ramka ADC idzie jako 0x100.
-         * Cokolwiek z ID <= 0x0FF traktujemy jako ważniejsze.
-         */
-        if (rxHeader.IDE == CAN_ID_STD && rxHeader.StdId <= CAN_HIGH_PRIO_MAX)
-        {
-            rxHighPrio = 1;   // Ustaw flagę – obsługa w pętli głównej
-        }
+        return;
     }
+
+    /* Slad dla debuggera - pokazuje, co naprawde wyslal CANtool */
+   /* canRxCount++;
+    canRxLastId  = (rxHeader.IDE == CAN_ID_STD) ? rxHeader.StdId : rxHeader.ExtId;
+    canRxLastIde = (uint8_t)rxHeader.IDE;
+    canRxLastRtr = (uint8_t)rxHeader.RTR;
+    canRxLastDlc = (uint8_t)rxHeader.DLC;
+*/
+    rxHighPrio = 1;
 }
+
+/**
+  * @brief Callback bledow magistrali CAN (warning / passive / bus-off)
+  *
+  * Przy bus-off sprzet odzyska magistrale sam (ABOM = ENABLE), ale ramki
+  * wiszace w mailboxach TX moglyby byc juz nieaktualne - przerywamy je,
+  * scheduler i tak wysle swieze dane w kolejnym obiegu petli.
+  */
+void HAL_CAN_ErrorCallback(CAN_HandleTypeDef *hcanPtr)
+{
+    canErrorCount++;
+
+    if (hcanPtr->ErrorCode & HAL_CAN_ERROR_BOF)
+    {
+        canBusOffCount++;
+        HAL_CAN_AbortTxRequest(hcanPtr,
+            CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2);
+    }
+
+    hcanPtr->ErrorCode = HAL_CAN_ERROR_NONE;
+}
+
 /* USER CODE END 4 */
 
 /**

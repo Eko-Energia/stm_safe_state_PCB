@@ -24,17 +24,58 @@
 #endif
 
 /**
- * @brief Initialize CAN with Node ID and error handler
+ * @brief Configure one filter bank as a list of accepted standard IDs
  */
-void CAN_init(CAN_HandleTypeDef *hcanPtr)
+HAL_StatusTypeDef CAN_setStdIdListFilter(CAN_HandleTypeDef *hcanPtr,
+                                         uint8_t bank,
+                                         const uint16_t *stdIds,
+                                         uint8_t count)
 {
-	if (HAL_CAN_ActivateNotification(hcanPtr, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
+	if (hcanPtr == NULL || stdIds == NULL ||
+		count == 0U || count > CAN_FILTER_IDS_PER_BANK ||
+		bank > CAN_FILTER_BANK_MAX)
 	{
-		Error_Handler();
+		return HAL_ERROR;
 	}
 
-	CAN_FilterTypeDef filterConfig;
+	uint16_t slot[CAN_FILTER_IDS_PER_BANK];
+	for (uint8_t i = 0U; i < CAN_FILTER_IDS_PER_BANK; i++)
+	{
+		/* Wolne sloty duplikuja ostatnie ID - slot pozostawiony jako 0x0000
+		 * akceptowalby ramke o ID 0 */
+		uint16_t id = (i < count) ? stdIds[i] : stdIds[count - 1U];
 
+		if (id > CAN_STD_ID_MAX)
+		{
+			return HAL_ERROR;
+		}
+		slot[i] = CAN_STD_ID(id);
+	}
+
+	CAN_FilterTypeDef filterConfig = {0};
+
+	filterConfig.FilterBank = bank;
+	filterConfig.FilterMode = CAN_FILTERMODE_IDLIST;
+	filterConfig.FilterScale = CAN_FILTERSCALE_16BIT;
+	filterConfig.FilterIdHigh = slot[0];
+	filterConfig.FilterIdLow = slot[1];
+	filterConfig.FilterMaskIdHigh = slot[2];
+	filterConfig.FilterMaskIdLow = slot[3];
+	filterConfig.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+	filterConfig.FilterActivation = CAN_FILTER_ENABLE;
+	filterConfig.SlaveStartFilterBank = 14;
+
+	return HAL_CAN_ConfigFilter(hcanPtr, &filterConfig);
+}
+
+/**
+ * @brief Configure bank 0 to accept every frame on the bus
+ */
+static HAL_StatusTypeDef CAN_setAcceptAllFilter(CAN_HandleTypeDef *hcanPtr)
+{
+	CAN_FilterTypeDef filterConfig = {0};
+
+	/* Maska = 0 -> zaden bit ID nie jest porownywany */
 	filterConfig.FilterBank = 0;
 	filterConfig.FilterMode = CAN_FILTERMODE_IDMASK;
 	filterConfig.FilterScale = CAN_FILTERSCALE_32BIT;
@@ -42,20 +83,65 @@ void CAN_init(CAN_HandleTypeDef *hcanPtr)
 	filterConfig.FilterIdLow = 0x0000;
 	filterConfig.FilterMaskIdHigh = 0x0000;
 	filterConfig.FilterMaskIdLow = 0x0000;
-	filterConfig.FilterFIFOAssignment = CAN_RX_FIFO0;
-	filterConfig.FilterActivation = ENABLE;
+	filterConfig.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+	filterConfig.FilterActivation = CAN_FILTER_ENABLE;
 	filterConfig.SlaveStartFilterBank = 14;
 
-	if (HAL_CAN_ConfigFilter(hcanPtr, &filterConfig) != HAL_OK)
+	return HAL_CAN_ConfigFilter(hcanPtr, &filterConfig);
+}
+
+/**
+ * @brief Initialize CAN: filters, notifications (RX + bus errors), start
+ */
+HAL_StatusTypeDef CAN_init(CAN_HandleTypeDef *hcanPtr,
+                           const uint16_t *acceptedStdIds,
+                           uint8_t idCount)
+{
+	if (hcanPtr == NULL)
 	{
-		/* Filter configuration Error */
-		Error_Handler();
+		return HAL_ERROR;
 	}
 
-	if (HAL_CAN_Start(hcanPtr) != HAL_OK)
+	if (acceptedStdIds == NULL || idCount == 0U)
 	{
-		Error_Handler();
+		if (CAN_setAcceptAllFilter(hcanPtr) != HAL_OK)
+		{
+			return HAL_ERROR;
+		}
 	}
+	else
+	{
+		/* Kazde 4 ID zajmuja jeden bank filtra */
+		uint8_t bank = 0U;
+		for (uint8_t i = 0U; i < idCount; i += CAN_FILTER_IDS_PER_BANK)
+		{
+			uint8_t chunk = idCount - i;
+			if (chunk > CAN_FILTER_IDS_PER_BANK)
+			{
+				chunk = CAN_FILTER_IDS_PER_BANK;
+			}
+
+			if (CAN_setStdIdListFilter(hcanPtr, bank, &acceptedStdIds[i], chunk) != HAL_OK)
+			{
+				return HAL_ERROR;
+			}
+			bank++;
+		}
+	}
+
+	/* CAN_IT_ERROR (ERRIE) musi byc aktywne, by przerwania
+	 * warning/passive/bus-off w ogole byly generowane */
+	if (HAL_CAN_ActivateNotification(hcanPtr,
+			CAN_IT_RX_FIFO0_MSG_PENDING |
+			CAN_IT_ERROR |
+			CAN_IT_ERROR_WARNING |
+			CAN_IT_ERROR_PASSIVE |
+			CAN_IT_BUSOFF) != HAL_OK)
+	{
+		return HAL_ERROR;
+	}
+
+	return HAL_CAN_Start(hcanPtr);
 }
 
 /**
@@ -64,13 +150,13 @@ void CAN_init(CAN_HandleTypeDef *hcanPtr)
 HAL_StatusTypeDef CAN_addScheduledMessage(struct CAN_scheduledMsg msg, struct CAN_scheduledMsgList *buffer)
 {
 	// basic error checking
-	if (buffer->size >= CAN_MAX_MSG - 1)
+	if (buffer == NULL || buffer->size >= CAN_MAX_MSG)
 	{
-		Error_Handler();
+		return HAL_ERROR;
 	}
-	if (msg.periodMs == 0)
+	if (msg.periodMs == 0 || msg.header.DLC > CAN_MAX_DLC)
 	{
-		Error_Handler();
+		return HAL_ERROR;
 	}
 
 	msg.lastTick = HAL_GetTick();
@@ -95,15 +181,19 @@ HAL_StatusTypeDef CAN_addScheduledMessage(struct CAN_scheduledMsg msg, struct CA
  */
 HAL_StatusTypeDef CAN_removeScheduledMessage(uint32_t id, struct CAN_scheduledMsgList *buffer)
 {
+	if (buffer == NULL)
+	{
+		return HAL_ERROR;
+	}
+
 	for (uint8_t i = 0; i < buffer->size; i++)
 	{
 		if ((buffer->list[i].header.IDE == CAN_ID_STD && buffer->list[i].header.StdId == id) ||
 			(buffer->list[i].header.IDE == CAN_ID_EXT && buffer->list[i].header.ExtId == id))
 		{
-			while (i + 1 < buffer->size)
+			for (uint8_t j = i; j + 1 < buffer->size; j++)
 			{
-				buffer->list[i] = buffer->list[i + 1];
-				i++;
+				buffer->list[j] = buffer->list[j + 1];
 			}
 			buffer->size--;
 			return HAL_OK;
@@ -127,26 +217,124 @@ void CAN_handleScheduled(CAN_HandleTypeDef *hcanPtr, struct CAN_scheduledMsgList
 	for (uint8_t i = 0; i < scheduler->size; i++)
 	{
 		struct CAN_scheduledMsg *msg = &scheduler->list[i];
-		if (currentTick > msg->lastTick + msg->periodMs)
-		{
-			uint8_t data[msg->header.DLC];
-			// Initialize data to 0 to be safe
-			for(int k=0; k<msg->header.DLC; k++)
-			{
-				data[k] = 0;
-			}
-			
-			if (msg->getData != NULL)
-			{
-				msg->getData(data, msg->context);
-			}
-			
-			if (HAL_CAN_AddTxMessage(hcanPtr, &msg->header, data, &scheduler->txMailbox) != HAL_OK)
-			{
-				return;
-			}
 
-			msg->lastTick = HAL_GetTick();
+		/* Odejmowanie unsigned - odporne na przepelnienie HAL_GetTick() */
+		if ((uint32_t)(currentTick - msg->lastTick) < msg->periodMs)
+		{
+			continue;
 		}
+
+		/* Wszystkie 3 mailboxy TX zajete (np. error passive / brak ACK) -
+		 * nie probujemy dalej, wyslemy w nastepnym obiegu petli */
+		if (HAL_CAN_GetTxMailboxesFreeLevel(hcanPtr) == 0U)
+		{
+			return;
+		}
+
+		uint8_t data[CAN_MAX_DLC] = {0};
+		if (msg->getData != NULL)
+		{
+			msg->getData(data, msg->context);
+		}
+
+		if (HAL_CAN_AddTxMessage(hcanPtr, &msg->header, data, &scheduler->txMailbox) != HAL_OK)
+		{
+			return;
+		}
+
+		msg->lastTick = currentTick;
 	}
+}
+/**
+ * @brief Send a single standard data frame immediately (event-driven)
+ */
+HAL_StatusTypeDef CAN_sendStdFrame(CAN_HandleTypeDef *hcanPtr, uint16_t stdId,
+                                   const uint8_t *data, uint8_t dlc)
+{
+	if (hcanPtr == NULL || stdId > CAN_STD_ID_MAX || dlc > CAN_MAX_DLC)
+	{
+		return HAL_ERROR;
+	}
+	if (dlc > 0U && data == NULL)
+	{
+		return HAL_ERROR;
+	}
+
+	/* Brak wolnej skrzynki - niech wolajacy sprobuje w kolejnym obiegu petli */
+	if (HAL_CAN_GetTxMailboxesFreeLevel(hcanPtr) == 0U)
+	{
+		return HAL_BUSY;
+	}
+
+	CAN_TxHeaderTypeDef header = {0};
+	header.StdId = stdId;
+	header.ExtId = 0;
+	header.IDE = CAN_ID_STD;
+	header.RTR = CAN_RTR_DATA;
+	header.DLC = dlc;
+	header.TransmitGlobalTime = DISABLE;
+
+	/* Kopia lokalna - HAL_CAN_AddTxMessage przyjmuje wskaznik bez const */
+	uint8_t payload[CAN_MAX_DLC] = {0};
+	for (uint8_t i = 0U; i < dlc; i++)
+	{
+		payload[i] = data[i];
+	}
+
+	uint32_t txMailbox;
+	return HAL_CAN_AddTxMessage(hcanPtr, &header, payload, &txMailbox);
+}
+
+/**
+ * @brief Rejestruje handler dla danego ID ramki
+ */
+HAL_StatusTypeDef CAN_addRxHandler(struct CAN_rxHandler handler,
+                                   struct CAN_rxHandlerList *table)
+{
+    if (table == NULL || table->size >= CAN_MAX_MSG) {
+        return HAL_ERROR;
+    }
+
+    /* Sprawdź duplikat ID */
+    for (uint8_t i = 0; i < table->size; i++) {
+        if (table->list[i].ide == handler.ide &&
+            table->list[i].id  == handler.id) {
+            return HAL_ERROR;  /* już zarejestrowany */
+        }
+    }
+
+    table->list[table->size] = handler;
+    table->size++;
+    return HAL_OK;
+}
+
+/**
+ * @brief Czyta ramkę z FIFO i wywołuje odpowiedni callback
+ *        Wywołuj z HAL_CAN_RxFifo0MsgPendingCallback !
+ */
+void CAN_dispatchRx(CAN_HandleTypeDef *hcanPtr,
+                    struct CAN_rxHandlerList *table)
+{
+    CAN_RxHeaderTypeDef rxHeader;
+    uint8_t rxData[8];
+
+    if (HAL_CAN_GetRxMessage(hcanPtr, CAN_RX_FIFO0,
+                             &rxHeader, rxData) != HAL_OK) {
+        return;
+    }
+
+    uint32_t rxId  = (rxHeader.IDE == CAN_ID_STD)
+                     ? rxHeader.StdId : rxHeader.ExtId;
+
+    for (uint8_t i = 0; i < table->size; i++) {
+        if (table->list[i].ide == rxHeader.IDE &&
+            table->list[i].id  == rxId) {
+            if (table->list[i].callback != NULL) {
+                table->list[i].callback(rxData, rxHeader.DLC,
+                                        table->list[i].context);
+            }
+            return;  /* jeden handler na ID — wychodzimy */
+        }
+    }
+    /* Brak handlera — ramka zignorowana (możesz tu dodać log) */
 }
