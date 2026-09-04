@@ -1,0 +1,2 @@
+../Core/Src/app_sync_tick.c:14:13:SyncTickTest_GetData	1
+../Core/Src/app_sync_tick.c:24:6:SyncTickTest_Init	1

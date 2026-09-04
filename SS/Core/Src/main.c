@@ -50,7 +50,16 @@
  * naszym wyborem i wymaga uzgodnienia z zespolem. */
 #define CAN_TX_ID_SS_ACTIV      SAFE_STATE_ACTIV_ID
 #define CAN_DLC_SS_ACTIV        8
-#define CAN_PERIOD_SS_ACTIV_MS  100
+#define CAN_PERIOD_SS_ACTIV_MS  5000
+
+/* Watchdog komendy throttle od JETSONa (BO_ 550 / BO_ 551).
+ * Ramka z THROTTLE_ARM_VALUE uzbraja i odswieza stoper. Gdy przez
+ * THROTTLE_TIMEOUT_MS nie przyjdzie kolejna, wysylamy te sama ramke
+ * z THROTTLE_SAFE_VALUE i rozbrajamy stoper do nastepnego uzbrojenia. */
+#define THROTTLE_DLC            8
+#define THROTTLE_ARM_VALUE      1      // wartosc, ktora uzbraja stoper
+#define THROTTLE_SAFE_VALUE     (-1)   // wysylane po przekroczeniu czasu
+#define THROTTLE_TIMEOUT_MS     150
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -87,10 +96,29 @@ static volatile uint8_t  canRxLastIde = 0;  // 0 = Standard, 4 = Extended
 static volatile uint8_t  canRxLastRtr = 0;  // 0 = Data,     2 = Remote
 static volatile uint8_t  canRxLastDlc = 0;
 
+/* Watchdog komendy throttle - jeden wpis na silnik.
+ * Pola pisane sa z przerwania RX, czytane w petli glownej -> volatile. */
+typedef struct {
+    uint16_t          id;             // ID monitorowanej ramki
+    volatile uint8_t  armed;          // 1 = stoper biegnie
+    volatile uint32_t lastRxTick;     // moment ostatniej ramki uzbrajajacej
+    volatile uint32_t timeoutCount;   // diagnostyka: ile razy zadzialal
+} ThrottleWatchdog_t;
+
+static ThrottleWatchdog_t throttleWd[] = {
+    { .id = JETSON_ENGINE_LEFT_RPDO1_ID  },
+    { .id = JETSON_ENGINE_RIGHT_RPDO1_ID },
+};
+#define THROTTLE_WD_COUNT ((uint8_t)(sizeof(throttleWd) / sizeof(throttleWd[0])))
+
 #if !CAN_RX_PROMISCUOUS
-/* Jedyne ID przyjmowane przez ten wezel - pozostale ramki odrzuca sprzet,
+/* ID przyjmowane przez ten wezel - pozostale ramki odrzuca sprzet,
  * wiec callback RX w ogole sie dla nich nie uruchamia */
-static const uint16_t canAcceptedIds[] = { SAFE_STATE_ACTIV_ID };
+static const uint16_t canAcceptedIds[] = {
+    SAFE_STATE_ACTIV_ID,            // 1   - aktywacja stanu bezpiecznego
+    JETSON_ENGINE_LEFT_RPDO1_ID,    // 550 - throttle lewy
+    JETSON_ENGINE_RIGHT_RPDO1_ID,   // 551 - throttle prawy
+};
 #define CAN_ACCEPTED_ID_COUNT ((uint8_t)(sizeof(canAcceptedIds) / sizeof(canAcceptedIds[0])))
 #endif
 
@@ -274,18 +302,45 @@ int main(void)
 		  }
 	  }
 
-	  // 3. Wysylka ramek okresowych (o tempie decyduje periodMs, nie liczba wywolan)
+	  uint32_t now = HAL_GetTick();
+
+	  // 3. Watchdog komendy throttle. Stoper uzbraja przerwanie RX; jesli przez
+	  //    THROTTLE_TIMEOUT_MS nie przyjdzie kolejna komenda, wysylamy raz
+	  //    wartosc bezpieczna i rozbrajamy stoper.
+	  for (uint8_t i = 0U; i < THROTTLE_WD_COUNT; i++)
+	  {
+		  if (!throttleWd[i].armed)
+		  {
+			  continue;
+		  }
+		  if ((uint32_t)(now - throttleWd[i].lastRxTick) < THROTTLE_TIMEOUT_MS)
+		  {
+			  continue;
+		  }
+
+		  uint8_t payload[THROTTLE_DLC] = {0};
+		  payload[0] = (uint8_t)( (uint16_t)THROTTLE_SAFE_VALUE       & 0xFF);
+		  payload[1] = (uint8_t)(((uint16_t)THROTTLE_SAFE_VALUE >> 8) & 0xFF);
+
+		  if (CAN_sendStdFrame(&hcan, throttleWd[i].id,
+		                       payload, THROTTLE_DLC) == HAL_OK)
+		  {
+			  throttleWd[i].armed = 0;
+			  throttleWd[i].timeoutCount++;
+		  }
+	  }
+
+	  // 4. Wysylka ramek okresowych (o tempie decyduje periodMs, nie liczba wywolan)
 	  CAN_handleScheduled(&hcan, &canScheduler);
 
-	  // 4. Reakcja na odebrana ramke wysokiego priorytetu
+	  // 5. Reakcja na odebrana ramke wysokiego priorytetu
 	  if (rxHighPrio)
 	  {
 		  rxHighPrio = 0;
 		  HAL_GPIO_WritePin(GPIOA, control_status_Pin, GPIO_PIN_RESET);
 	  }
 
-	  // 5. Heartbeat LED
-	  uint32_t now = HAL_GetTick();
+	  // 6. Heartbeat LED
 	  if ((now - lastLedToggle) >= LED_TOGGLE_MS)
 	  {
 		  lastLedToggle = now;
@@ -496,13 +551,47 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcanPtr)
     }
 
     /* Slad dla debuggera - pokazuje, co naprawde wyslal CANtool */
-   /* canRxCount++;
+    canRxCount++;
     canRxLastId  = (rxHeader.IDE == CAN_ID_STD) ? rxHeader.StdId : rxHeader.ExtId;
     canRxLastIde = (uint8_t)rxHeader.IDE;
     canRxLastRtr = (uint8_t)rxHeader.RTR;
     canRxLastDlc = (uint8_t)rxHeader.DLC;
-*/
-    rxHighPrio = 1;
+
+    /* Interesuja nas wylacznie standardowe ramki danych */
+    if (rxHeader.IDE != CAN_ID_STD || rxHeader.RTR != CAN_RTR_DATA)
+    {
+        return;
+    }
+
+    /* Aktywacja stanu bezpiecznego */
+    if (rxHeader.StdId == SAFE_STATE_ACTIV_ID)
+    {
+        rxHighPrio = 1;
+        return;
+    }
+
+    /* Komenda throttle - uzbrojenie / odswiezenie stopera */
+    for (uint8_t i = 0U; i < THROTTLE_WD_COUNT; i++)
+    {
+        if (rxHeader.StdId != throttleWd[i].id)
+        {
+            continue;
+        }
+
+        if (rxHeader.DLC >= 2U)
+        {
+            /* Sygnal 0|16@1- : int16, little endian */
+            int16_t throttle = (int16_t)((uint16_t)rxData[0] |
+                                        ((uint16_t)rxData[1] << 8));
+
+            if (throttle == THROTTLE_ARM_VALUE)
+            {
+                throttleWd[i].lastRxTick = HAL_GetTick();
+                throttleWd[i].armed      = 1;
+            }
+        }
+        return;
+    }
 }
 
 /**

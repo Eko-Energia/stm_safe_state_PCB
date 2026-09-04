@@ -16,6 +16,14 @@
 #define SAFE_STATE_END_ID      31   /* BO_ 31 SafeState_END */
 
 /*
+ * JETSON - komendy throttle do sterownikow silnikow (CAN_DB.dbc)
+ * Sygnal throttle: 0|16@1- czyli int16 little-endian, zakres -32768..32767
+ */
+
+#define JETSON_ENGINE_LEFT_RPDO1_ID   550  /* BO_ 550 JETSON_STATIC_EngineLeft_RPDO1  */
+#define JETSON_ENGINE_RIGHT_RPDO1_ID  551  /* BO_ 551 JETSON_STATIC_EngineRight_RPDO1 */
+
+/*
  * RCD
  */
 
